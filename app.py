@@ -705,6 +705,132 @@ def calculate_province_summary(processed_df, province_name):
     return province_metrics
 
 
+
+def detect_requested_technology(question):
+    """Return an OnSSET technology key only when it is explicitly named."""
+    q = normalize_text(question)
+    aliases = {
+        "mini_grid": ("mini-grid", "mini grid", "minigrid", "microgrid"),
+        "standalone_solar": ("solar home", "shs", "standalone solar", "stand-alone solar"),
+        "grid_densification": ("grid densification", "densification"),
+        "grid_extension": ("grid extension", "extension"),
+    }
+    for technology, terms in aliases.items():
+        if any(term in q for term in terms):
+            return technology
+    return None
+
+
+def concise_province_answer(question, province_metrics):
+    """Answer single-metric Admin1 questions without dumping every provincial metric.
+
+    Returns None for an explicit province overview or a question that this
+    deterministic metric selector does not support (handled by the caller).
+    """
+    q = normalize_text(question)
+    province = province_metrics["province_name"]
+    technology = detect_requested_technology(q)
+    tech_display = {
+        "mini_grid": "mini-grids",
+        "standalone_solar": "solar home systems",
+        "grid_densification": "grid densification",
+        "grid_extension": "grid extension",
+    }
+    tech_label = tech_display.get(technology)
+
+    # Users requesting the report intentionally should still receive it.
+    if any(term in q for term in (
+        "province summary", "provincial summary", "full summary", "full report",
+        "complete report", "all metrics", "overview", "summarize everything",
+    )):
+        return None
+
+    heading = f"### {province} Province — Selected 2030 OnSSET Scenario"
+    connections = province_metrics["estimated_household_connections_by_technology"]
+    capacity = province_metrics["capacity_by_technology_kw"]
+    investments = {
+        "mini_grid": province_metrics["mini_grid_investment_usd"],
+        "standalone_solar": province_metrics["standalone_solar_investment_usd"],
+        "grid_densification": province_metrics["grid_densification_investment_usd"],
+        "grid_extension": province_metrics["grid_extension_investment_usd"],
+    }
+    mini = province_metrics["mini_grid_summary"]
+    pop = province_metrics["population_summary"]
+
+    wants_households = ("household" in q or "connection" in q)
+    wants_investment = any(term in q for term in ("invest", "cost", "capex", "expenditure"))
+    wants_capacity = any(term in q for term in ("capacity", "kw", "kilowatt", "mw", "megawatt"))
+    wants_population = any(term in q for term in ("population", "unelectrified"))
+    wants_clusters = any(term in q for term in ("cluster", "settlement", "how many mini-grid", "how many mini grid", "number of mini-grid", "number of mini grid"))
+
+    # Explicit cost-per-connection questions are different from total CAPEX.
+    if wants_investment and wants_households and any(term in q for term in ("per household", "per connection", "average cost")):
+        if technology:
+            investment = investments[technology]
+            households = connections[technology]
+        else:
+            investment = province_metrics["total_investment_usd"]
+            households = province_metrics["estimated_household_connections"]
+        if households == 0:
+            return f"{heading}\n\nAverage cost per household connection is unavailable because estimated connections are zero."
+        scope = tech_label or "all technologies"
+        return f"{heading}\n\n**{format_usd_per_connection(investment / households)}** is the modelled average investment per estimated household connection for {scope}."
+
+    if wants_investment:
+        if technology:
+            return f"{heading}\n\n**{format_usd(investments[technology])}** is the modelled investment for {tech_label} in {province}."
+        if "by technology" in q or "technology breakdown" in q or "each technology" in q:
+            lines = [f"- **{tech_display[k].capitalize()}:** {format_usd(v)}" for k,v in investments.items()]
+            return f"{heading}\n\n**Modelled investment by technology:**\n" + "\n".join(lines)
+        return f"{heading}\n\n**{format_usd(province_metrics['total_investment_usd'])}** is the total modelled investment across the four supported technology categories."
+
+    if wants_capacity:
+        if technology:
+            if technology == "mini_grid" and "average" in q:
+                return f"{heading}\n\n**{format_capacity(mini['average_mini_grid_capacity_kw'])}** is the average modelled new capacity per mini-grid settlement cluster."
+            return f"{heading}\n\n**{format_capacity(capacity[technology])}** is the modelled new capacity for {tech_label} in {province}."
+        if "by technology" in q or "technology breakdown" in q or "each technology" in q:
+            lines = [f"- **{tech_display[k].capitalize()}:** {format_capacity(v)}" for k,v in capacity.items()]
+            return f"{heading}\n\n**Modelled new capacity by technology:**\n" + "\n".join(lines)
+        return f"{heading}\n\n**{format_capacity(province_metrics['total_new_capacity_kw'])}** is the total modelled new capacity across the four supported technology categories."
+
+    # Household connections must precede mini-grid cluster counts: "How many
+    # households could mini-grids serve?" is a connections question, not a count.
+    if wants_households:
+        if technology:
+            return (
+                f"{heading}\n\n**{format_count(connections[technology])} estimated household connections** "
+                f"are modelled for {tech_label} in {province} under the selected scenario."
+            )
+        if "by technology" in q or "each technology" in q:
+            lines = [f"- **{tech_display[k].capitalize()}:** {format_count(v, 'households')}" for k,v in connections.items()]
+            return f"{heading}\n\n**Estimated household connections by technology:**\n" + "\n".join(lines)
+        if "connection" in q or "electrif" in q or "connected" in q:
+            return f"{heading}\n\n**{format_count(province_metrics['estimated_household_connections'], 'households')}** are the total estimated household connections across the four supported technology categories."
+        # A bare "How many households are in Nampula?" is ambiguous: the
+        # connection metric is not necessarily the total resident households.
+        return "Do you mean **estimated new household connections** or **all households living in the province in 2030**?"
+
+    if wants_population:
+        if "unelectrified" in q or "un-electrified" in q:
+            if "10 km" in q or "10km" in q or "near" in q:
+                return f"{heading}\n\n**{format_count(pop['unelectrified_within_10km_mv'], 'people')}** were estimated to be unelectrified at the start year and within 10 km of existing MV lines."
+            return f"{heading}\n\n**{format_count(pop['unelectrified_population_start'], 'people')}** were estimated to be unelectrified at the start year."
+        if "2030" in q:
+            return f"{heading}\n\n**{format_count(pop['target_population_2030'], 'people')}** is the modelled 2030 population."
+        return f"{heading}\n\n**Base-year population:** {format_count(pop['base_population'], 'people')}\n\n**2030 population:** {format_count(pop['target_population_2030'], 'people')}"
+
+    if wants_clusters:
+        if technology == "mini_grid":
+            return f"{heading}\n\n**{format_count(mini['mini_grid_cluster_count'])} settlement clusters** are assigned mini-grid technologies. This is not necessarily the number of engineered mini-grid projects."
+        if technology:
+            return f"{heading}\n\nA settlement-cluster count for {tech_label} is not yet supported by this province query module."
+        return f"{heading}\n\n**{format_count(province_metrics['settlement_cluster_count'])} settlement clusters** are included in {province}."
+
+    # Unrecognized province questions should not silently trigger an
+    # unrelated report; let the caller handle them explicitly.
+    return None
+
 def convert_df(df_to_download):
     return df_to_download.to_csv(index=False).encode("utf-8")
 
@@ -1624,7 +1750,13 @@ I could not find `{province_match}` in the active scenario file's `Admin1` colum
                     mg = province_metrics["mini_grid_summary"]
                     hh = province_metrics["estimated_household_connections_by_technology"]
 
-                    province_response = f"""### Province Summary: {province_metrics['province_name']}
+                    concise_answer = concise_province_answer(user_query, province_metrics)
+                    if concise_answer is not None:
+                        display_and_store_response(concise_answer)
+                    else:
+                        # A full provincial report is retained for explicit
+                        # summary/overview requests and legacy behavior.
+                        province_response = f"""### Province Summary: {province_metrics['province_name']}
 
 #### Settlement Coverage
 * **Settlement Clusters in Province:** {province_metrics['settlement_cluster_count']:,}
@@ -1667,7 +1799,7 @@ This province summary filters the processed scenario file where:
 
 Then it reuses the same deterministic calculation engine used for the national outputs.
 """
-                    display_and_store_response(province_response)
+                        display_and_store_response(province_response)
 
         elif is_population_query:
             pop = metrics["population_summary"]
